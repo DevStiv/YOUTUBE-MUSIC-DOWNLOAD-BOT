@@ -37,20 +37,23 @@ from config import (
 from database import (
     init_db,
     get_or_create_user,
+    cycle_quick_mode,
     process_referral,
     set_vip,
     record_star_payment,
-    toggle_auto_download,
     can_download,
     increment_download,
-    get_cached_audio,
-    save_cached_audio,
+    get_cached_media,
+    save_cached_media,
+    clear_all_cache,
     get_stats,
     get_all_user_ids,
 )
 from extractors import (
     get_media_metadata,
     download_media_audio,
+    download_media_video,
+    download_image_file,
     search_tracks_inline,
     cleanup_files,
     janitor_cleanup_loop,
@@ -60,31 +63,73 @@ from middlewares import RateLimitMiddleware
 logging.basicConfig(level=logging.INFO)
 router = Router()
 
-# Almacén temporal en memoria para metadatos pendientes de selección de calidad
-PENDING_TRACKS: Dict[str, dict] = {}
+# Memoria temporal para selecciones de botones
+PENDING_MEDIA: Dict[str, dict] = {}
 
 
 def format_duration(seconds: int) -> str:
+    if not seconds:
+        return "N/A"
     mins, secs = divmod(seconds, 60)
     hours, mins = divmod(mins, 60)
     return f"{hours}:{mins:02d}:{secs:02d}" if hours else f"{mins}:{secs:02d}"
 
 
-def main_menu_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
+def quick_mode_label(mode: str) -> str:
+    labels = {
+        "ask": "🎛 Panel Interactivo (Audio / Video / Foto)",
+        "auto_audio": "🎵 Descarga Directa MP3",
+        "auto_video": "🎬 Descarga Directa Video MP4",
+    }
+    return labels.get(mode, labels["ask"])
+
+
+def main_menu_kb(user_id: int = 0) -> InlineKeyboardMarkup:
+    rows = [
         [
-            InlineKeyboardButton(text="👤 Mi Cuenta", callback_data="menu:account"),
-            InlineKeyboardButton(text="💎 Hazte VIP (Stars)", callback_data="menu:vip"),
+            InlineKeyboardButton(text="👤 Mi Cuenta", callback_data="nav:account"),
+            InlineKeyboardButton(text="💎 Tienda VIP", callback_data="nav:vip"),
         ],
         [
-            InlineKeyboardButton(text="🎁 Invitar Amigos", callback_data="menu:ref"),
-            InlineKeyboardButton(text="⚙️ Ajustes", callback_data="menu:settings"),
-        ]
+            InlineKeyboardButton(text="🎁 Ganar VIP Gratis", callback_data="nav:ref"),
+            InlineKeyboardButton(text="⚙️ Modo de Descarga", callback_data="nav:settings"),
+        ],
+        [
+            InlineKeyboardButton(text="🌐 Plataformas Soportadas", callback_data="nav:platforms"),
+            InlineKeyboardButton(text="🔎 Buscar en Línea", switch_inline_query_current_chat=""),
+        ],
+    ]
+    if user_id in ADMIN_IDS:
+        rows.append([InlineKeyboardButton(text="🛡️ Panel Admin SaaS", callback_data="admin:home")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def media_selector_kb(token: str, meta: dict) -> InlineKeyboardMarkup:
+    rows = []
+    if not meta.get("is_image"):
+        rows.append([
+            InlineKeyboardButton(text="🎵 MP3 128k", callback_data=f"dl:{token}:audio:mp3:128"),
+            InlineKeyboardButton(text="💎 MP3 320k", callback_data=f"dl:{token}:audio:mp3:320"),
+            InlineKeyboardButton(text="🎼 M4A VIP", callback_data=f"dl:{token}:audio:m4a:256"),
+        ])
+    if meta.get("has_video"):
+        rows.append([
+            InlineKeyboardButton(text="🎬 Video 480p", callback_data=f"dl:{token}:video:mp4:480"),
+            InlineKeyboardButton(text="💎 HD 720p", callback_data=f"dl:{token}:video:mp4:720"),
+            InlineKeyboardButton(text="💎 1080p", callback_data=f"dl:{token}:video:mp4:1080"),
+        ])
+    if meta.get("thumbnail"):
+        btn_label = "🖼️ Descargar Foto Original HD" if meta.get("is_image") else "🖼️ Descargar Portada / Foto HD"
+        rows.append([
+            InlineKeyboardButton(text=btn_label, callback_data=f"dl:{token}:photo:jpg:hd")
+        ])
+    rows.append([
+        InlineKeyboardButton(text="❌ Cancelar", callback_data=f"dl:{token}:cancel:0:0")
     ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 async def check_force_sub(bot: Bot, user_id: int, plan: str) -> bool:
-    """Verifica si el usuario está suscrito al canal obligatorio (VIP exentos)."""
     if not FORCE_CHANNEL_ID or plan == "vip" or user_id in ADMIN_IDS:
         return True
     try:
@@ -94,20 +139,28 @@ async def check_force_sub(bot: Bot, user_id: int, plan: str) -> bool:
             ChatMemberStatus.ADMINISTRATOR,
             ChatMemberStatus.CREATOR,
         )
-    except Exception as e:
-        logging.warning(f"No se pudo verificar canal obligatorio: {e}")
+    except Exception:
         return True
 
 
-# --- COMANDO /START Y REFERIDOS ---
+async def safe_ui_update(callback: CallbackQuery, text: str, reply_markup: InlineKeyboardMarkup):
+    """Edita mensaje de texto o reemplaza si el mensaje previo tenía foto/media."""
+    if callback.message.text:
+        await callback.message.edit_text(text, reply_markup=reply_markup)
+    else:
+        await callback.message.delete()
+        await callback.message.answer(text, reply_markup=reply_markup)
+
+
+# --- COMANDO /START Y MENÚS DE BOTONES ---
 
 @router.message(CommandStart())
 async def cmd_start(message: Message, command: CommandObject):
     ref_id = None
     if command.args and command.args.startswith("ref_"):
-        raw_ref = command.args.replace("ref_", "")
-        if raw_ref.isdigit():
-            ref_id = int(raw_ref)
+        raw = command.args.replace("ref_", "")
+        if raw.isdigit():
+            ref_id = int(raw)
 
     user, is_new = await get_or_create_user(
         message.from_user.id,
@@ -118,10 +171,10 @@ async def cmd_start(message: Message, command: CommandObject):
     if is_new and user.get("referred_by"):
         count, rewarded = await process_referral(user["referred_by"])
         try:
-            msg_ref = f"🎉 ¡Un amigo se unió con tu enlace! Llevas <b>{count}</b> invitados."
+            alert = f"🎉 ¡Nuevo referido registrado! Total invitados: <b>{count}</b>."
             if rewarded:
-                msg_ref += f"\n💎 <b>¡Meta alcanzada!</b> Se han acreditado <b>+{REFERRAL_REWARD_DAYS} días VIP</b> a tu cuenta."
-            await message.bot.send_message(user["referred_by"], msg_ref)
+                alert += f"\n💎 <b>¡Felicidades!</b> Ganaste <b>+{REFERRAL_REWARD_DAYS} días VIP</b>."
+            await message.bot.send_message(user["referred_by"], alert)
         except Exception:
             pass
 
@@ -129,99 +182,208 @@ async def cmd_start(message: Message, command: CommandObject):
     quota = "∞ Ilimitadas" if user["plan"] == "vip" else f"{user['daily_downloads']}/{FREE_DAILY_LIMIT}"
 
     text = (
-        f"🎧 <b>OmniAudio SaaS — Extractor Universal</b>\n\n"
-        f"Envíame un enlace de <b>YouTube, Spotify, SoundCloud, TikTok, Instagram, Facebook o X</b>, o escribe directamente el <b>nombre de una canción</b>.\n\n"
+        f"⚡ <b>OmniMedia SaaS — Suite de Descargas Todo-en-Uno</b>\n\n"
+        f"Envía cualquier enlace o escribe el nombre de una canción/video para descargar <b>Videos MP4, Música MP3/M4A y Fotos HD</b> con botones interactivos.\n\n"
         f"• <b>Plan Actual:</b> {plan_badge}\n"
-        f"• <b>Cuota Diaria:</b> {quota}\n\n"
-        f"💡 <i>También puedes escribir</i> <code>@{(await message.bot.me()).username} canción</code> <i>en cualquier chat.</i>"
+        f"• <b>Cuota Hoy:</b> {quota}\n"
+        f"• <b>Modo Activo:</b> {quick_mode_label(user['quick_mode'])}\n\n"
+        f"👇 <i>Usa los botones de abajo o pega un enlace directamente:</i>"
     )
-    await message.answer(text, reply_markup=main_menu_kb())
+    await message.answer(text, reply_markup=main_menu_kb(message.from_user.id))
 
 
-# --- MENÚS INTERACTIVOS ---
-
-@router.callback_query(F.data == "menu:account")
-async def cb_account(callback: CallbackQuery):
+@router.callback_query(F.data == "nav:home")
+async def cb_home(callback: CallbackQuery):
     user, _ = await get_or_create_user(callback.from_user.id, callback.from_user.username)
-    plan = "💎 VIP Activo" if user["plan"] == "vip" else "🆓 Plan Gratuito"
-    expiry = f"\n• <b>Expira:</b> {user['vip_until'][:10]}" if user["vip_until"] else ""
-    quota = "Ilimitadas" if user["plan"] == "vip" else f"{user['daily_downloads']}/{FREE_DAILY_LIMIT}"
+    plan_badge = "💎 VIP" if user["plan"] == "vip" else "🆓 FREE"
+    quota = "∞ Ilimitadas" if user["plan"] == "vip" else f"{user['daily_downloads']}/{FREE_DAILY_LIMIT}"
 
     text = (
-        f"📊 <b>Perfil de Suscripción</b>\n\n"
-        f"• <b>ID:</b> <code>{user['user_id']}</code>\n"
-        f"• <b>Nivel:</b> {plan}{expiry}\n"
-        f"• <b>Descargas Hoy:</b> {quota}\n"
-        f"• <b>Total Histórico:</b> {user['total_downloads']}\n"
-        f"• <b>Amigos Invitados:</b> {user['referrals_count']}"
+        f"⚡ <b>OmniMedia SaaS — Panel Principal</b>\n\n"
+        f"• <b>Plan:</b> {plan_badge}\n"
+        f"• <b>Cuota Hoy:</b> {quota}\n"
+        f"• <b>Modo Activo:</b> {quick_mode_label(user['quick_mode'])}\n\n"
+        f"<i>Pega cualquier enlace en el chat o navega con los botones:</i>"
     )
-    await callback.message.edit_text(text, reply_markup=main_menu_kb())
+    await safe_ui_update(callback, text, main_menu_kb(callback.from_user.id))
     await callback.answer()
 
 
-@router.callback_query(F.data == "menu:vip")
+@router.callback_query(F.data == "nav:account")
+async def cb_account(callback: CallbackQuery):
+    user, _ = await get_or_create_user(callback.from_user.id, callback.from_user.username)
+    plan = "💎 VIP Activo" if user["plan"] == "vip" else "🆓 Plan Gratuito"
+    expiry = f"\n• <b>Vence:</b> {user['vip_until'][:10]}" if user["vip_until"] else ""
+    quota = "Ilimitadas" if user["plan"] == "vip" else f"{user['daily_downloads']}/{FREE_DAILY_LIMIT}"
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💎 Mejorar a VIP", callback_data="nav:vip")],
+        [InlineKeyboardButton(text="🔙 Menú Principal", callback_data="nav:home")],
+    ])
+    text = (
+        f"👤 <b>Tu Cuenta SaaS</b>\n\n"
+        f"• <b>ID de Usuario:</b> <code>{user['user_id']}</code>\n"
+        f"• <b>Suscripción:</b> {plan}{expiry}\n"
+        f"• <b>Descargas Hoy:</b> {quota}\n"
+        f"• <b>Total Descargado:</b> {user['total_downloads']} archivos\n"
+        f"• <b>Amigos Invitados:</b> {user['referrals_count']}"
+    )
+    await safe_ui_update(callback, text, kb)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "nav:platforms")
+async def cb_platforms(callback: CallbackQuery):
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔎 Buscar Ahora", switch_inline_query_current_chat="")],
+        [InlineKeyboardButton(text="🔙 Menú Principal", callback_data="nav:home")],
+    ])
+    text = (
+        f"🌐 <b>Plataformas y Formatos Compatibles</b>\n\n"
+        f"🎬 <b>Videos (MP4 480p / 720p / 1080p):</b>\n"
+        f"YouTube, Shorts, TikTok (sin marca de agua), Instagram Reels, Facebook, X/Twitter, Reddit, Pinterest.\n\n"
+        f"🎵 <b>Música y Audio (MP3 128k / 320k / M4A):</b>\n"
+        f"YouTube Music, Spotify (Tracks), SoundCloud, Bandcamp y extracción de audio de cualquier video.\n\n"
+        f"🖼️ <b>Fotos y Portadas HD:</b>\n"
+        f"Miniaturas de alta resolución, portadas de álbumes y enlaces de imágenes directas."
+    )
+    await safe_ui_update(callback, text, kb)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "nav:vip")
 async def cb_vip_store(callback: CallbackQuery):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=f"⭐ VIP 7 Días — {VIP_PRICE_STARS_7D} Stars", callback_data="buy_vip:7")],
         [InlineKeyboardButton(text=f"🌟 VIP 30 Días — {VIP_PRICE_STARS_30D} Stars", callback_data="buy_vip:30")],
-        [InlineKeyboardButton(text="🔙 Volver", callback_data="menu:account")],
+        [InlineKeyboardButton(text="🔙 Menú Principal", callback_data="nav:home")],
     ])
     text = (
-        f"💎 <b>Membresía OmniAudio VIP</b>\n\n"
-        f"✅ Descargas diarias <b>ilimitadas</b>\n"
-        f"✅ Calidad máxima <b>MP3 320 kbps y M4A Lossless</b>\n"
-        f"✅ Pistas, podcasts y sets de hasta <b>2 horas</b>\n"
-        f"✅ Sin suscripción obligatoria a canales\n"
-        f"✅ Prioridad máxima en servidores\n\n"
-        f"<i>Activación instantánea mediante Telegram Stars:</i>"
+        f"💎 <b>Membresía OmniMedia VIP</b>\n\n"
+        f"✅ <b>Descargas Ilimitadas</b> todos los días\n"
+        f"✅ <b>Videos en HD 720p y Full HD 1080p</b>\n"
+        f"✅ <b>Audio MP3 320 kbps y M4A Original</b>\n"
+        f"✅ Duración extendida hasta <b>2 horas</b>\n"
+        f"✅ Sin canales obligatorios y prioridad de velocidad\n\n"
+        f"<i>Elige tu plan para activar al instante con Telegram Stars:</i>"
     )
-    await callback.message.edit_text(text, reply_markup=kb)
+    await safe_ui_update(callback, text, kb)
     await callback.answer()
 
 
-@router.callback_query(F.data == "menu:ref")
-async def cb_referrals(callback: CallbackQuery):
+@router.callback_query(F.data == "nav:ref")
+async def cb_ref(callback: CallbackQuery):
     user, _ = await get_or_create_user(callback.from_user.id)
     bot_username = (await callback.bot.me()).username
     ref_link = f"https://t.me/{bot_username}?start=ref_{user['user_id']}"
     restantes = REFERRALS_FOR_VIP - (user["referrals_count"] % REFERRALS_FOR_VIP)
 
-    text = (
-        f"🎁 <b>Programa de Recompensas</b>\n\n"
-        f"Invita a tus amigos y obtén <b>{REFERRAL_REWARD_DAYS} días de VIP GRATIS</b> cada vez que <b>{REFERRALS_FOR_VIP} usuarios</b> entren con tu enlace.\n\n"
-        f"• <b>Invitados totales:</b> {user['referrals_count']}\n"
-        f"• <b>Faltan para tu próximo premio:</b> {restantes} amigos\n\n"
-        f"🔗 <b>Tu enlace personal:</b>\n<code>{ref_link}</code>"
-    )
-    await callback.message.edit_text(text, reply_markup=main_menu_kb())
-    await callback.answer()
-
-
-@router.callback_query(F.data == "menu:settings")
-async def cb_settings(callback: CallbackQuery):
-    user, _ = await get_or_create_user(callback.from_user.id)
-    auto_status = "✅ ACTIVADO (Descarga al pegar link)" if user["auto_download"] else "❌ DESACTIVADO (Elegir calidad)"
-
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔄 Cambiar Modo Auto-Descarga", callback_data="toggle:auto")],
-        [InlineKeyboardButton(text="🔙 Volver", callback_data="menu:account")],
+        [InlineKeyboardButton(
+            text="📲 Compartir mi Enlace con Amigos",
+            url=f"https://t.me/share/url?url={ref_link}&text=Descarga%20Videos%2C%20M%C3%BAsica%20y%20Fotos%20en%20HD%20con%20este%20bot!"
+        )],
+        [InlineKeyboardButton(text="🔙 Menú Principal", callback_data="nav:home")],
     ])
     text = (
-        f"⚙️ <b>Preferencias de Usuario</b>\n\n"
-        f"• <b>Modo Descarga Directa:</b> {auto_status}\n\n"
-        f"<i>Cuando está desactivado, podrás elegir formato (MP3 128k / 320k / M4A) antes de descargar.</i>"
+        f"🎁 <b>Gana VIP Gratis Invitando Amigos</b>\n\n"
+        f"Recibe <b>{REFERRAL_REWARD_DAYS} días de VIP automático</b> por cada <b>{REFERRALS_FOR_VIP} amigos</b> que inicien el bot con tu enlace.\n\n"
+        f"• <b>Tus invitados:</b> {user['referrals_count']}\n"
+        f"• <b>Te faltan:</b> {restantes} amigos para el próximo premio\n\n"
+        f"🔗 <b>Tu enlace:</b>\n<code>{ref_link}</code>"
     )
-    await callback.message.edit_text(text, reply_markup=kb)
+    await safe_ui_update(callback, text, kb)
     await callback.answer()
 
 
-@router.callback_query(F.data == "toggle:auto")
-async def cb_toggle_auto(callback: CallbackQuery):
-    await toggle_auto_download(callback.from_user.id)
+@router.callback_query(F.data == "nav:settings")
+async def cb_settings(callback: CallbackQuery):
+    user, _ = await get_or_create_user(callback.from_user.id)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Cambiar Modo de Descarga", callback_data="toggle:mode")],
+        [InlineKeyboardButton(text="🔙 Menú Principal", callback_data="nav:home")],
+    ])
+    text = (
+        f"⚙️ <b>Configuración de Comodidad</b>\n\n"
+        f"• <b>Modo Actual:</b> {quick_mode_label(user['quick_mode'])}\n\n"
+        f"🔹 <b>Panel Interactivo:</b> Te muestra foto, datos y botones para elegir Video, Audio o Foto en cada link.\n"
+        f"🔹 <b>Descarga Directa MP3:</b> Envía el audio inmediatamente al pegar un link.\n"
+        f"🔹 <b>Descarga Directa Video:</b> Envía el video MP4 inmediatamente al pegar un link."
+    )
+    await safe_ui_update(callback, text, kb)
+    await callback.answer()
+
+
+@router.callback_query(F.data == "toggle:mode")
+async def cb_toggle_mode(callback: CallbackQuery):
+    await cycle_quick_mode(callback.from_user.id)
     await cb_settings(callback)
 
 
-# --- SISTEMA DE PAGOS CON TELEGRAM STARS ---
+# --- PANEL DE ADMINISTRACIÓN INTERACTIVO ---
+
+@router.message(Command("admin"))
+async def cmd_admin_panel(message: Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    s = await get_stats()
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🔄 Actualizar Métricas", callback_data="admin:home"),
+            InlineKeyboardButton(text="🧹 Vaciar Caché", callback_data="admin:clear_cache"),
+        ],
+        [InlineKeyboardButton(text="🔙 Menú Usuario", callback_data="nav:home")],
+    ])
+    text = (
+        f"🛡️ <b>Centro de Control Admin SaaS</b>\n\n"
+        f"👥 <b>Usuarios Totales:</b> {s['total_users']}\n"
+        f"💎 <b>Usuarios VIP Activos:</b> {s['vip_users']}\n"
+        f"📥 <b>Descargas Entregadas:</b> {s['total_downloads']}\n"
+        f"⚡ <b>Archivos en Caché:</b> {s['cached_items']}\n"
+        f"⭐ <b>Ingresos Stars:</b> {s['total_stars']} XTR\n\n"
+        f"<i>Comandos rápidos:</i>\n"
+        f"• <code>/addvip ID DIAS</code>\n"
+        f"• <code>/broadcast Mensaje</code>"
+    )
+    await message.answer(text, reply_markup=kb)
+
+
+@router.callback_query(F.data == "admin:home")
+async def cb_admin_home(callback: CallbackQuery):
+    if callback.from_user.id not in ADMIN_IDS:
+        return
+    s = await get_stats()
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🔄 Actualizar Métricas", callback_data="admin:home"),
+            InlineKeyboardButton(text="🧹 Vaciar Caché", callback_data="admin:clear_cache"),
+        ],
+        [InlineKeyboardButton(text="🔙 Menú Usuario", callback_data="nav:home")],
+    ])
+    text = (
+        f"🛡️ <b>Centro de Control Admin SaaS</b>\n\n"
+        f"👥 <b>Usuarios Totales:</b> {s['total_users']}\n"
+        f"💎 <b>Usuarios VIP Activos:</b> {s['vip_users']}\n"
+        f"📥 <b>Descargas Entregadas:</b> {s['total_downloads']}\n"
+        f"⚡ <b>Archivos en Caché:</b> {s['cached_items']}\n"
+        f"⭐ <b>Ingresos Stars:</b> {s['total_stars']} XTR\n\n"
+        f"• Dar VIP: <code>/addvip ID DIAS</code>\n"
+        f"• Anuncio: <code>/broadcast Mensaje</code>"
+    )
+    await safe_ui_update(callback, text, kb)
+    await callback.answer("Métricas actualizadas")
+
+
+@router.callback_query(F.data == "admin:clear_cache")
+async def cb_admin_clear_cache(callback: CallbackQuery):
+    if callback.from_user.id not in ADMIN_IDS:
+        return
+    removed = await clear_all_cache()
+    await callback.answer(f"🧹 Se eliminaron {removed} registros del caché.", show_alert=True)
+    await cb_admin_home(callback)
+
+
+# --- PAGOS AUTOMÁTICOS TELEGRAM STARS ---
 
 @router.callback_query(F.data.startswith("buy_vip:"))
 async def cb_buy_vip(callback: CallbackQuery):
@@ -229,11 +391,11 @@ async def cb_buy_vip(callback: CallbackQuery):
     stars = VIP_PRICE_STARS_7D if days == 7 else VIP_PRICE_STARS_30D
 
     await callback.message.answer_invoice(
-        title=f"OmniAudio VIP ({days} Días)",
-        description=f"Acceso ilimitado, audio 320kbps / M4A y duración extendida durante {days} días.",
+        title=f"OmniMedia VIP ({days} Días)",
+        description=f"Descargas ilimitadas de Videos Full HD, Audios 320kbps y Fotos durante {days} días.",
         payload=f"vip_{days}_{callback.from_user.id}",
-        currency="XTR",  # Moneda oficial Telegram Stars
-        prices=[LabeledPrice(label=f"Suscripción VIP {days}d", amount=stars)],
+        currency="XTR",
+        prices=[LabeledPrice(label=f"VIP {days} Días", amount=stars)],
     )
     await callback.answer()
 
@@ -246,31 +408,118 @@ async def process_pre_checkout(pre_checkout: PreCheckoutQuery):
 @router.message(F.successful_payment)
 async def process_successful_payment(message: Message):
     payment = message.successful_payment
-    payload_parts = payment.invoice_payload.split("_")
-    days = int(payload_parts[1])
-    user_id = int(payload_parts[2])
+    parts = payment.invoice_payload.split("_")
+    days, user_id = int(parts[1]), int(parts[2])
 
     until = await set_vip(user_id, days)
     await record_star_payment(user_id, payment.telegram_payment_charge_id, payment.total_amount, days)
 
     await message.answer(
-        f"🎉 <b>¡Pago confirmado! Bienvenido a VIP</b>\n\n"
-        f"• <b>Duración:</b> {days} días\n"
-        f"• <b>Válido hasta:</b> {until[:10]}\n\n"
-        f"Ya puedes disfrutar de descargas ilimitadas en máxima calidad.",
-        reply_markup=main_menu_kb()
+        f"🎉 <b>¡Suscripción VIP Activada!</b>\n\n"
+        f"• <b>Plan:</b> +{days} días VIP\n"
+        f"• <b>Activo hasta:</b> {until[:10]}\n\n"
+        f"Disfruta de videos en 1080p y música en 320kbps sin límites.",
+        reply_markup=main_menu_kb(user_id)
     )
 
 
-# --- BÚSQUEDA INLINE (@bot consulta) ---
+# --- BÚSQUEDA INLINE ---
 
 @router.inline_query()
-async def inline_music_search(inline_query: InlineQuery):
+async def inline_search(inline_query: InlineQuery):
     query = inline_query.query.strip()
     if len(query) < 2:
         return
-
     tracks = await search_tracks_inline(query, limit=6)
+    results = [
+        InlineQueryResultArticle(
+            id=f"{t['id']}_{i}",
+            title=t["title"],
+            description=f"⏱ {format_duration(t['duration'])} • {t['uploader']}",
+            input_message_content=InputTextMessageContent(message_text=t["url"]),
+        )
+        for i, t in enumerate(tracks)
+    ]
+    await inline_query.answer(results, cache_time=60)
+
+
+# --- COMANDOS RÁPIDOS DE ADMIN ---
+
+@router.message(Command("addvip"))
+async def cmd_addvip(message: Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    parts = message.text.split()
+    if len(parts) != 3 or not parts[1].isdigit() or not parts[2].isdigit():
+        await message.answer("Uso: <code>/addvip USER_ID DIAS</code>")
+        return
+    uid, days = int(parts[1]), int(parts[2])
+    await get_or_create_user(uid)
+    until = await set_vip(uid, days)
+    await message.answer(f"✅ Usuario <code>{uid}</code> ahora es VIP hasta {until[:10]}.")
+
+
+@router.message(Command("broadcast"))
+async def cmd_broadcast(message: Message):
+    if message.from_user.id not in ADMIN_IDS:
+        return
+    body = message.text.replace("/broadcast", "", 1).strip()
+    if not body:
+        await message.answer("Uso: <code>/broadcast Mensaje</code>")
+        return
+    uids = await get_all_user_ids()
+    sent, fail = 0, 0
+    status = await message.answer(f"📣 Enviando a {len(uids)} usuarios...")
+    for u in uids:
+        try:
+            await message.bot.send_message(u, f"📢 <b>Anuncio Oficial</b>\n\n{body}")
+            sent += 1
+            await asyncio.sleep(0.05)
+        except Exception:
+            fail += 1
+    await status.edit_text(f"✅ Difusión completada.\n• Enviados: {sent}\n• Fallidos: {fail}")
+
+
+# --- MOTOR DE ENTREGA MULTIMODAL (AUDIO, VIDEO Y FOTO) ---
+
+def after_download_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text="🏠 Menú Principal", callback_data="nav:home"),
+            InlineKeyboardButton(text="💎 Planes VIP", callback_data="nav:vip"),
+        ]
+    ])
+
+
+async def deliver_media(
+    chat_message: Message,
+    user: dict,
+    meta: dict,
+    media_type: str,
+    codec: str,
+    quality: str,
+    ui_msg: Message
+):
+    variant_key = f"{media_type}_{codec}_{quality}"
+    cached = await get_cached_media(meta["uid"], variant_key)
+
+    caption = (
+        f"✨ <b>{meta['title']}</b>\n"
+        f"🌐 {meta['platform']} • {media_type.upper()} ({quality})"
+    )
+
+    if cached:
+        try:
+            if media_type == "audio":
+                await chat_message.answer_audio(
+                    audio=cached["file_id"],
+                    title=cached["title"],
+                    performer=cached["artist"],
+                    duration=cached["duration"],
+                    caption=caption,
+                    reply_markup=after_download_kb(),
+                )
+            elif meks_inline(query, limit=6)
     results = []
     for idx, t in enumerate(tracks):
         dur = format_duration(t["duration"])
